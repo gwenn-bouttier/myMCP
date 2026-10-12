@@ -9,6 +9,12 @@ from fastmcp import FastMCP
 mcp = FastMCP("myMCP")
 
 
+@mcp.tool
+def statut() -> str:
+    """Vérifie que le serveur MCP est en ligne."""
+    return "ok le mcp est live"
+
+
 # Exemple pour ajouter un outil plus tard :
 #
 # @mcp.tool
