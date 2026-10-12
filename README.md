@@ -9,7 +9,7 @@ Serveur MCP personnel, écrit avec FastMCP et déployé sur Prefect Horizon.
 3. Les dépendances sont lues dans `requirements.txt`.
 4. Chaque push sur `main` redéploie automatiquement.
 
-URL du serveur : `https://techpolecorp.fastmcp.app/mcp`
+URL du serveur : `https://myfirstmcpgbo.fastmcp.app/mcp` (authentification requise)
 
 ## Ajouter un outil
 
