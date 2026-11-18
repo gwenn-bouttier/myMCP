@@ -89,47 +89,85 @@ def prochain_weekend(aujourd_hui: date) -> tuple[date, date]:
     return samedi, samedi + timedelta(days=1)
 
 
-async def geocoder(client: httpx.AsyncClient, nom: str, pays: str | None = None) -> dict | None:
-    """Géocode un lieu. Pour un nom ambigu, garde le résultat le plus haut en altitude
-    (pertinent pour une station de ski). `pays` = code ISO à 2 lettres (ex. "FR")."""
-    cle = f"{nom}|{pays}"
+async def geocoder(
+    client: httpx.AsyncClient, nom: str, pays: str | None = None, critere: str = "elevation"
+) -> dict | None:
+    """Géocode un lieu. Pour un nom ambigu dans le pays demandé, garde le résultat au plus
+    grand `critere` : "elevation" pour une station de ski, "population" pour une ville.
+    `pays` = code ISO à 2 lettres (ex. "FR")."""
+    cle = f"{nom}|{pays}|{critere}"
     if cle in _cache_geo:
         return _cache_geo[cle]
-    r = await client.get(
-        GEOCODING_URL,
-        params={"name": nom, "count": 10, "language": "fr", "format": "json"},
+    data = await _get_json(
+        client, GEOCODING_URL, {"name": nom, "count": 10, "language": "fr", "format": "json"}
     )
-    r.raise_for_status()
-    resultats = r.json().get("results") or []
+    resultats = data.get("results") or []
     if pays:
         resultats = [x for x in resultats if x.get("country_code") == pays.upper()]
     lieu = None
     if resultats:
-        lieu = max(resultats, key=lambda x: x.get("elevation") or 0) if pays else resultats[0]
+        lieu = max(resultats, key=lambda x: x.get(critere) or 0) if pays else resultats[0]
     _cache_geo[cle] = lieu
     return lieu
 
 
-async def prevision_station(client: httpx.AsyncClient, lat: float, lon: float) -> dict:
-    """Prévisions journalières + hauteur de neige horaire, avec 3 jours d'historique."""
-    r = await client.get(
+async def _get_json(client: httpx.AsyncClient, url: str, params: dict, essais: int = 6):
+    """GET avec nouvelles tentatives sur 429/5xx et coupures réseau
+    (le quota gratuit Open-Meteo est compté par IP, souvent partagée en hébergement)."""
+    for i in range(essais):
+        dernier = i == essais - 1
+        try:
+            r = await client.get(url, params=params)
+        except httpx.TransportError:
+            if dernier:
+                raise
+            await asyncio.sleep(1 + i)
+            continue
+        if (r.status_code == 429 or r.status_code >= 500) and not dernier:
+            await asyncio.sleep(1 + i)
+            continue
+        r.raise_for_status()
+        return r.json()
+
+
+async def previsions_stations(
+    client: httpx.AsyncClient, lieux: list[dict], samedi: date
+) -> list[dict]:
+    """Prévisions des stations via des requêtes Open-Meteo multi-coordonnées (paquets de 8),
+    de J-3 (neige tombée avant) au dimanche. Renvoie une prévision par lieu, dans l'ordre."""
+    if len(lieux) > 8:
+        res = []
+        for k in range(0, len(lieux), 8):
+            res += await previsions_stations(client, lieux[k:k + 8], samedi)
+        return res
+    data = await _get_json(
+        client,
         FORECAST_URL,
-        params={
-            "latitude": lat,
-            "longitude": lon,
+        {
+            "latitude": ",".join(str(l["latitude"]) for l in lieux),
+            "longitude": ",".join(str(l["longitude"]) for l in lieux),
             "daily": ",".join([
                 "snowfall_sum", "precipitation_sum", "temperature_2m_max",
                 "temperature_2m_min", "wind_gusts_10m_max", "sunshine_duration",
                 "weather_code",
             ]),
             "hourly": "snow_depth,freezing_level_height",
-            "past_days": 3,
-            "forecast_days": 16,
+            "start_date": (samedi - timedelta(days=3)).isoformat(),
+            "end_date": (samedi + timedelta(days=1)).isoformat(),
             "timezone": "Europe/Paris",
         },
     )
-    r.raise_for_status()
-    return r.json()
+    return data if isinstance(data, list) else [data]
+
+
+def verifier_fenetre(samedi: date) -> str | None:
+    """Open-Meteo prévoit 16 jours max : refuse un week-end trop lointain."""
+    aujourd_hui = datetime.now(ZoneInfo("Europe/Paris")).date()
+    if samedi + timedelta(days=1) > aujourd_hui + timedelta(days=15):
+        return f"Week-end du {samedi} hors de la fenêtre de prévision (16 jours)."
+    if samedi + timedelta(days=1) < aujourd_hui - timedelta(days=60):
+        return f"Week-end du {samedi} trop ancien."
+    return None
 
 
 def _jour(daily: dict, d: date) -> dict | None:
@@ -265,11 +303,13 @@ async def meteo_station_ski(station: str, date_samedi: str | None = None) -> dic
             16 jours max).
     """
     samedi = _samedi_cible(date_samedi)
+    if err := verifier_fenetre(samedi):
+        return {"erreur": err}
     async with httpx.AsyncClient(timeout=15) as client:
         lieu = await geocoder(client, station, pays=None)
         if not lieu:
             return {"erreur": f"Station introuvable : {station}"}
-        prev = await prevision_station(client, lieu["latitude"], lieu["longitude"])
+        prev = (await previsions_stations(client, [lieu], samedi))[0]
     analyse = analyser_weekend(prev, samedi)
     if not analyse:
         return {"erreur": f"Week-end du {samedi} hors de la fenêtre de prévision (16 jours)."}
@@ -291,6 +331,7 @@ async def meilleures_stations_ski(
     top: int = 3,
     stations: list[str] | None = None,
     trajet_max_h: float | None = None,
+    pays_depart: str = "FR",
 ) -> dict:
     """Classe les stations de ski pour un week-end hors-piste / poudreuse en combinant
     neige fraîche, hauteur de neige, météo (soleil, vent), froid et temps de trajet.
@@ -302,13 +343,18 @@ async def meilleures_stations_ski(
         top: nombre de stations à renvoyer (défaut 3).
         stations: liste de stations à comparer (défaut : ~25 stations françaises).
         trajet_max_h: exclut les stations au-delà de cette durée de route.
+        pays_depart: code pays ISO de la ville de départ (défaut "FR").
     """
     samedi = _samedi_cible(date_samedi)
+    if err := verifier_fenetre(samedi):
+        return {"erreur": err}
     noms = stations or STATIONS_PAR_DEFAUT
     sem = asyncio.Semaphore(5)
 
     async with httpx.AsyncClient(timeout=20) as client:
-        origine = await geocoder(client, depart, pays=None)
+        origine = await geocoder(client, depart, pays=pays_depart, critere="population")
+        if not origine:
+            origine = await geocoder(client, depart, pays=None)
         if not origine:
             return {"erreur": f"Ville de départ introuvable : {depart}"}
 
@@ -327,14 +373,10 @@ async def meilleures_stations_ski(
 
         trajets = await temps_de_trajet(client, origine, [l for _, l in trouves])
 
-        async def prev(lieu):
-            async with sem:
-                try:
-                    return await prevision_station(client, lieu["latitude"], lieu["longitude"])
-                except httpx.HTTPError:
-                    return None
-
-        previsions = await asyncio.gather(*(prev(l) for _, l in trouves))
+        try:
+            previsions = await previsions_stations(client, [l for _, l in trouves], samedi)
+        except httpx.HTTPError as e:
+            return {"erreur": f"Prévisions Open-Meteo indisponibles : {e}"}
 
     classement, erreurs = [], []
     for (nom, lieu), trajet, p in zip(trouves, trajets, previsions):
@@ -355,7 +397,7 @@ async def meilleures_stations_ski(
 
     classement.sort(key=lambda x: x["score_sur_100"], reverse=True)
     return {
-        "depart": origine.get("name"),
+        "depart": f"{origine.get('name')} ({origine.get('admin1')}, {origine.get('country_code')})",
         "weekend": f"{samedi.isoformat()} / {(samedi + timedelta(days=1)).isoformat()}",
         "top": classement[: max(1, top)],
         "nb_stations_comparees": len(classement),
