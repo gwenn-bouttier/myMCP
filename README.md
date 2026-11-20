@@ -1,6 +1,6 @@
 # myMCP
 
-Serveur MCP personnel, écrit avec FastMCP et déployé sur Prefect Horizon.
+Serveur MCP personnel, écrit avec FastMCP, enrichi à la volée par moi et claude et déployé sur Prefect Horizon.
 
 ## Déploiement sur Horizon
 
